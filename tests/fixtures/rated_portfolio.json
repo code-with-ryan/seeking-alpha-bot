@@ -1,0 +1,5 @@
+{
+  "AAPL": {"weight": 0.5, "rating": "Strong Buy", "picked": "2026-10-01"},
+  "MSFT": {"weight": 0.2, "rating": "Buy", "picked": "2025-01-01"},
+  "GOOG": {"weight": 0.3, "rating": "Hold", "picked": "2026-09-20"}
+}

@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+/portfolio.json
+trades.jsonl
+.pytest_cache/
+v2/
+.vscode/
