@@ -70,34 +70,6 @@ def compute_rebalance_orders(
     return orders
 
 
-def apply_cash_buffer(orders: list[Order], cash: float, buffer_pct: float) -> list[Order]:
-    """Scale down buy orders (proportionally; sells are untouched) so their total never
-    exceeds buffer_pct of available cash. This is a cushion against price drift/slippage
-    between computing an order and it actually filling -- not a change to the target
-    weights, which is why it only touches buys (sells free up cash, they don't spend it)
-    and leaves compute_rebalance_orders itself buffer-free so targets still match exactly.
-
-    "Available cash" includes this batch's sell proceeds, not just pre-existing cash --
-    a sell and a buy in the same sync commonly fund each other (e.g. closing a dropped
-    pick to help pay for a new one), so ignoring sell proceeds would wrongly starve a
-    buy that's actually fully funded.
-    """
-    sell_total = sum(o.notional for o in orders if o.side == "sell")
-    buy_total = sum(o.notional for o in orders if o.side == "buy")
-    max_deployable = (cash + sell_total) * buffer_pct
-
-    if buy_total <= max_deployable or buy_total == 0:
-        return orders
-
-    scale = max_deployable / buy_total
-    return [
-        Order(ticker=o.ticker, side=o.side, notional=o.notional * scale, reason=o.reason, full_close=o.full_close)
-        if o.side == "buy"
-        else o
-        for o in orders
-    ]
-
-
 def drop_subminimum_buys(orders: list[Order], minimum: float = MIN_BUY_NOTIONAL) -> list[Order]:
     """Drop buy orders Alpaca would reject outright for being under its notional minimum,
     instead of submitting them and letting that failure print. These are immaterial

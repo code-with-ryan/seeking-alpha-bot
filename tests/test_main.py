@@ -1,4 +1,5 @@
 import json
+import os
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -7,13 +8,12 @@ from config import Config
 from main import run_sync
 
 
-def _cfg(trade_log_path: str, cash_buffer_pct: float = 1.0) -> Config:
+def _cfg(trade_log_path: str) -> Config:
     return Config(
         alpaca_api_key="key",
         alpaca_secret_key="secret",
         alpaca_base_url="https://paper-api.alpaca.markets",
         trade_log_path=trade_log_path,
-        cash_buffer_pct=cash_buffer_pct,
     )
 
 
@@ -117,8 +117,6 @@ def test_sync_order_failure_is_reported_and_not_logged(mock_load_config, mock_br
 
     captured = capsys.readouterr()
     assert "FAILED" in captured.err
-    import os
-
     assert not os.path.exists(trade_log_path)
 
 
@@ -142,8 +140,6 @@ def test_sync_accepted_but_unfilled_order_is_reported_and_not_logged(mock_load_c
     captured = capsys.readouterr()
     assert "FAILED" in captured.err
     assert "rejected" in captured.err
-    import os
-
     assert not os.path.exists(trade_log_path)
 
 
@@ -152,7 +148,9 @@ def test_sync_accepted_but_unfilled_order_is_reported_and_not_logged(mock_load_c
 def test_sync_full_close_uses_close_position(mock_load_config, mock_broker_cls, tmp_path):
     mock_load_config.return_value = _cfg(str(tmp_path / "trades.jsonl"))
     broker = mock_broker_cls.return_value
-    broker.get_cash.return_value = 0.0
+    # Initial query (before any sells) sees $0 cash; the live check before the AAPL buy
+    # queries again and sees the $500 TSLA's sell just produced.
+    broker.get_cash.side_effect = [0.0, 500.0]
     broker.get_positions.return_value = {"TSLA": 500.0}
     broker.close_position.return_value = "close-order-1"
     broker.submit_notional_order.return_value = "order-1"
@@ -185,22 +183,22 @@ def test_sync_skips_buy_orders_under_alpaca_minimum_notional(mock_load_config, m
 
 @patch("main.Broker")
 @patch("main.load_config")
-def test_sync_submits_all_sells_before_any_buys(mock_load_config, mock_broker_cls, tmp_path):
+def test_sync_waits_for_sells_to_fill_before_sizing_any_buy(mock_load_config, mock_broker_cls, tmp_path):
     mock_load_config.return_value = _cfg(str(tmp_path / "trades.jsonl"))
     broker = mock_broker_cls.return_value
-    broker.get_cash.return_value = 0.0
     # Both AAPL (held, needs trimming down) and MSFT (held, not in target at all -> full close)
-    # must be sold before GOOG (not held, needs a full buy) is submitted.
+    # must be sold -- and those sells confirmed filled -- before GOOG is bought.
     broker.get_positions.return_value = {"AAPL": 800.0, "MSFT": 200.0}
-    broker.close_position.return_value = "close-order-1"
-    broker.submit_notional_order.return_value = "order-1"
     broker.wait_for_orders.return_value = {}
+    # Initial query sees $0 cash; the live check before the GOOG buy sees the $600
+    # (400 + 200) the AAPL/MSFT sells actually produced.
+    broker.get_cash.side_effect = [0.0, 600.0]
 
     call_order: list[str] = []
-    broker.close_position.side_effect = lambda ticker: (call_order.append(f"sell {ticker}"), "close-order-1")[1]
+    broker.close_position.side_effect = lambda ticker: (call_order.append(f"sell {ticker}"), "msft-close-order")[1]
     broker.submit_notional_order.side_effect = lambda ticker, side, notional: (
         call_order.append(f"{side} {ticker}"),
-        "order-1",
+        {"AAPL": "aapl-sell-order", "GOOG": "goog-buy-order"}[ticker],
     )[1]
 
     # total equity = 1000 -> AAPL target = 400 (sell 400), MSFT target = 0 (full close), GOOG target = 600 (buy).
@@ -208,26 +206,71 @@ def test_sync_submits_all_sells_before_any_buys(mock_load_config, mock_broker_cl
     run_sync(file_path, auto_yes=True)
 
     assert call_order == ["sell AAPL", "sell MSFT", "buy GOOG"]
+    # wait_for_orders is called once for the sell batch and once for the buy batch --
+    # not a single combined call -- which is what lets the buy phase react to real,
+    # post-sell cash instead of an estimate made before the sells even ran.
+    assert broker.wait_for_orders.call_count == 2
+    sell_call, buy_call = broker.wait_for_orders.call_args_list
+    assert sorted(sell_call.args[0]) == sorted(["aapl-sell-order", "msft-close-order"])
+    assert buy_call.args[0] == ["goog-buy-order"]
 
 
 @patch("main.Broker")
 @patch("main.load_config")
-def test_sync_cash_buffer_scales_buys_but_not_full_closes(mock_load_config, mock_broker_cls, tmp_path, capsys):
-    mock_load_config.return_value = _cfg(str(tmp_path / "trades.jsonl"), cash_buffer_pct=0.95)
+def test_sync_buy_gets_sized_down_to_whatever_cash_is_actually_available(mock_load_config, mock_broker_cls, tmp_path, capsys):
+    mock_load_config.return_value = _cfg(str(tmp_path / "trades.jsonl"))
     broker = mock_broker_cls.return_value
-    broker.get_cash.return_value = 1000.0
-    broker.get_positions.return_value = {"TSLA": 500.0}
-    broker.close_position.return_value = "close-order-1"
+    broker.get_positions.return_value = {}
     broker.submit_notional_order.return_value = "order-1"
+    broker.wait_for_orders.return_value = {"order-1": "filled"}
+    # total equity = 1000 -> AAPL target = $1000, but the live check before submitting
+    # sees only $400 actually available (e.g. prices moved, or the estimate was off).
+    broker.get_cash.side_effect = [1000.0, 400.0]
 
-    # total equity = 1500 -> target AAPL buy = $1500, TSLA (not in target) gets fully closed for $500.
-    # Available cash for the buffer = cash (1000) + TSLA's sell proceeds (500) = 1500, buffered at
-    # 95% = 1425 -- the AAPL buy must scale down to exactly that; the TSLA sell stays untouched.
     file_path = _portfolio_file(tmp_path, {"AAPL": 1.0})
     run_sync(file_path, auto_yes=True)
 
-    broker.close_position.assert_called_once_with("TSLA")  # sell side: unscaled
-    broker.submit_notional_order.assert_called_once_with("AAPL", "buy", pytest.approx(1425.0))
-
+    broker.submit_notional_order.assert_called_once_with("AAPL", "buy", pytest.approx(400.0))
     captured = capsys.readouterr()
-    assert "cash buffer" in captured.out
+    assert "buying as much as fits" in captured.out
+
+
+@patch("main.Broker")
+@patch("main.load_config")
+def test_sync_buy_skipped_entirely_when_available_cash_is_under_alpaca_minimum(mock_load_config, mock_broker_cls, tmp_path, capsys):
+    mock_load_config.return_value = _cfg(str(tmp_path / "trades.jsonl"))
+    broker = mock_broker_cls.return_value
+    broker.get_positions.return_value = {}
+    # total equity = 1000 -> AAPL target = $1000, but the live check sees only $0.50 left --
+    # under Alpaca's $1 minimum, so this buy is skipped outright rather than submitted for $0.50.
+    broker.get_cash.side_effect = [1000.0, 0.50]
+
+    file_path = _portfolio_file(tmp_path, {"AAPL": 1.0})
+    run_sync(file_path, auto_yes=True)
+
+    broker.submit_notional_order.assert_not_called()
+    captured = capsys.readouterr()
+    assert "Skipping buy AAPL" in captured.err
+    assert "$0.50" in captured.err
+
+
+@patch("main.Broker")
+@patch("main.load_config")
+def test_sync_each_buy_rechecks_cash_live_not_just_once(mock_load_config, mock_broker_cls, tmp_path):
+    mock_load_config.return_value = _cfg(str(tmp_path / "trades.jsonl"))
+    broker = mock_broker_cls.return_value
+    broker.get_positions.return_value = {}
+    broker.submit_notional_order.return_value = "order-1"
+    broker.wait_for_orders.return_value = {"order-1": "filled"}
+    # total equity = 1000 -> AAPL target = 600, MSFT target = 400 (ticker-sorted order).
+    # Initial query sees 1000; AAPL's live check also sees 1000 (full target fits);
+    # MSFT's live check sees only 300 left (AAPL already spent 600 of it for real).
+    broker.get_cash.side_effect = [1000.0, 1000.0, 300.0]
+
+    file_path = _portfolio_file(tmp_path, {"AAPL": 0.6, "MSFT": 0.4})
+    run_sync(file_path, auto_yes=True)
+
+    assert broker.get_cash.call_count == 3  # initial + one live check per buy
+    calls = broker.submit_notional_order.call_args_list
+    assert calls[0].args == ("AAPL", "buy", pytest.approx(600.0))
+    assert calls[1].args == ("MSFT", "buy", pytest.approx(300.0))

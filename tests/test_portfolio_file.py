@@ -100,3 +100,29 @@ def test_warns_when_weights_sum_well_over_one(tmp_path, capsys):
     load_portfolio_file(str(percent_file))
     captured = capsys.readouterr()
     assert "did you mean fractions" in captured.err
+
+
+def test_warns_when_weights_sum_moderately_over_one(tmp_path, capsys):
+    over_file = tmp_path / "over.json"
+    over_file.write_text('{"MU": 0.75, "AMZN": 0.60}')  # sums to 135% -- a plausible typo, not a 100x one
+    load_portfolio_file(str(over_file))
+    captured = capsys.readouterr()
+    assert "over 100%" in captured.err
+    assert "did you mean fractions" not in captured.err  # that's the >150% message, not this one
+
+
+def test_no_warning_when_weights_sum_to_exactly_one(tmp_path, capsys):
+    clean_file = tmp_path / "clean.json"
+    clean_file.write_text('{"MU": 0.5, "AMZN": 0.5}')
+    load_portfolio_file(str(clean_file))
+    captured = capsys.readouterr()
+    assert captured.err == ""
+
+
+def test_no_warning_for_float_sum_noise_just_over_one(tmp_path, capsys):
+    # These three weights sum to 1.0000000000000002 in float arithmetic -- not a real typo.
+    noisy_file = tmp_path / "noisy.json"
+    noisy_file.write_text('{"A": 0.2, "B": 0.69, "C": 0.11}')
+    load_portfolio_file(str(noisy_file))
+    captured = capsys.readouterr()
+    assert captured.err == ""

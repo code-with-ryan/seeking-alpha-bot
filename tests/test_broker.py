@@ -13,7 +13,6 @@ def _cfg(base_url="https://paper-api.alpaca.markets") -> Config:
         alpaca_secret_key="secret",
         alpaca_base_url=base_url,
         trade_log_path=":memory:",
-        cash_buffer_pct=1.0,
     )
 
 

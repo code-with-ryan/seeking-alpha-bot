@@ -2,9 +2,9 @@ import argparse
 import sys
 
 from broker import Broker
-from config import load_config
+from config import Config, load_config
 from portfolio_file import load_portfolio_file
-from rebalancer import MIN_BUY_NOTIONAL, Order, apply_cash_buffer, compute_rebalance_orders, drop_subminimum_buys
+from rebalancer import MIN_BUY_NOTIONAL, Order, compute_rebalance_orders, drop_subminimum_buys
 from trade_log import log_trade
 
 
@@ -20,6 +20,27 @@ def print_orders(orders: list[Order], targets: dict[str, float]) -> None:
         print(f"{order.side.upper():6}{order.ticker:8}{order.notional:>12,.2f}  {target_pct:.2%}{tag}")
 
 
+def _report_results(cfg: Config, submitted: dict[str, Order], statuses: dict[str, str]) -> None:
+    for order_id, order in submitted.items():
+        tag = " (full close)" if order.full_close else ""
+        status = statuses.get(order_id, "unknown")
+        if status == "filled":
+            log_trade(cfg.trade_log_path, order.ticker, order.side, order.notional, order_id, order.reason)
+            print(f"Submitted {order.side} {order.ticker} ${order.notional:,.2f}{tag} -- SUCCESS (order {order_id})")
+        elif status == "partially_filled":
+            print(
+                f"Submitted {order.side} {order.ticker} ${order.notional:,.2f}{tag} -- "
+                f"PARTIAL FILL, not logged -- check Alpaca for the actual filled amount (order {order_id})",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"Submitted {order.side} {order.ticker} ${order.notional:,.2f}{tag} -- "
+                f"FAILED ({status}, order {order_id})",
+                file=sys.stderr,
+            )
+
+
 def run_sync(file_path: str, auto_yes: bool) -> None:
     cfg = load_config()
     broker = Broker(cfg)
@@ -29,14 +50,6 @@ def run_sync(file_path: str, auto_yes: bool) -> None:
     current_values = broker.get_positions()
     total_equity = cash + sum(current_values.values())
     orders = compute_rebalance_orders(targets, current_values, cash)
-
-    buffered_orders = apply_cash_buffer(orders, cash, cfg.cash_buffer_pct)
-    if buffered_orders != orders:
-        held_back = sum(o.notional for o in orders if o.side == "buy") - sum(
-            o.notional for o in buffered_orders if o.side == "buy"
-        )
-        print(f"Scaling down buy orders to keep ${held_back:,.2f} in reserve ({cfg.cash_buffer_pct:.0%} cash buffer).")
-    orders = buffered_orders
 
     tradable_orders = drop_subminimum_buys(orders)
     skipped = [o for o in orders if o not in tradable_orders]
@@ -57,48 +70,54 @@ def run_sync(file_path: str, auto_yes: bool) -> None:
             print("Aborted -- no orders submitted.")
             return
 
-    # Sells first, buys second -- so buys aren't racing uncleared sell proceeds for
-    # buying power. Both groups keep their original (ticker-sorted) relative order.
     sells = [o for o in orders if o.side == "sell"]
     buys = [o for o in orders if o.side == "buy"]
 
-    submitted: dict[str, Order] = {}
-    for order in sells + buys:
+    # Phase 1: sells. Submitted and confirmed filled before any buy is sized, so buy
+    # sizing (phase 2) reacts to real post-sell cash instead of an upfront estimate.
+    sell_submitted: dict[str, Order] = {}
+    for order in sells:
         try:
-            if order.full_close:
-                order_id = broker.close_position(order.ticker)
-            else:
-                order_id = broker.submit_notional_order(order.ticker, order.side, order.notional)
+            order_id = broker.close_position(order.ticker) if order.full_close else broker.submit_notional_order(
+                order.ticker, order.side, order.notional
+            )
         except Exception as exc:
             print(f"FAILED {order.side} {order.ticker}: {exc}", file=sys.stderr)
             continue
-        submitted[order_id] = order
+        sell_submitted[order_id] = order
 
-    if not submitted:
-        return
+    if sell_submitted:
+        sell_statuses = broker.wait_for_orders(list(sell_submitted.keys()))
+        _report_results(cfg, sell_submitted, sell_statuses)
 
-    # One batched check covering every order just submitted, instead of polling each
-    # one individually -- confirming fills on 30 tickers takes the same ~10s as one.
-    statuses = broker.wait_for_orders(list(submitted.keys()))
-
-    for order_id, order in submitted.items():
-        tag = " (full close)" if order.full_close else ""
-        status = statuses.get(order_id, "unknown")
-        if status == "filled":
-            log_trade(cfg.trade_log_path, order.ticker, order.side, order.notional, order_id, order.reason)
-            print(f"Submitted {order.side} {order.ticker} ${order.notional:,.2f}{tag} -- SUCCESS (order {order_id})")
-        elif status == "partially_filled":
+    # Phase 2: buys. Not latency-sensitive, so cash is re-checked live before each one
+    # instead of estimating upfront and hoping -- buy as much of the target as actually
+    # fits right now; whatever doesn't fit this cycle gets picked up on the next sync.
+    buy_submitted: dict[str, Order] = {}
+    for order in buys:
+        available_cash = broker.get_cash()
+        notional = min(order.notional, available_cash)
+        if notional < MIN_BUY_NOTIONAL:
             print(
-                f"Submitted {order.side} {order.ticker} ${order.notional:,.2f}{tag} -- "
-                f"PARTIAL FILL, not logged -- check Alpaca for the actual filled amount (order {order_id})",
+                f"Skipping buy {order.ticker} -- only ${available_cash:,.2f} cash available "
+                f"(below Alpaca's ${MIN_BUY_NOTIONAL:.2f} minimum)",
                 file=sys.stderr,
             )
-        else:
-            print(
-                f"Submitted {order.side} {order.ticker} ${order.notional:,.2f}{tag} -- "
-                f"FAILED ({status}, order {order_id})",
-                file=sys.stderr,
-            )
+            continue
+        if notional < order.notional:
+            print(f"Only ${available_cash:,.2f} cash available for {order.ticker} (wanted ${order.notional:,.2f}) -- buying as much as fits")
+            order = Order(ticker=order.ticker, side=order.side, notional=notional, reason=order.reason, full_close=order.full_close)
+
+        try:
+            order_id = broker.submit_notional_order(order.ticker, order.side, order.notional)
+        except Exception as exc:
+            print(f"FAILED {order.side} {order.ticker}: {exc}", file=sys.stderr)
+            continue
+        buy_submitted[order_id] = order
+
+    if buy_submitted:
+        buy_statuses = broker.wait_for_orders(list(buy_submitted.keys()))
+        _report_results(cfg, buy_submitted, buy_statuses)
 
 
 def main() -> None:

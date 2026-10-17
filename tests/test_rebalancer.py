@@ -2,7 +2,6 @@ import pytest
 
 from rebalancer import (
     Order,
-    apply_cash_buffer,
     bootstrap_orders,
     compute_rebalance_orders,
     drop_subminimum_buys,
@@ -96,46 +95,6 @@ def test_compute_rebalance_orders_partial_sell_is_not_full_close():
 
 def test_compute_rebalance_orders_empty_portfolio():
     assert compute_rebalance_orders({}, {}, cash=0.0) == []
-
-
-def test_apply_cash_buffer_no_scaling_when_under_limit():
-    orders = [Order("AAPL", "buy", 500.0, "sync")]
-    result = apply_cash_buffer(orders, cash=1000.0, buffer_pct=0.95)
-    assert result == orders
-
-
-def test_apply_cash_buffer_scales_buys_proportionally_when_over_limit():
-    # Full bootstrap: buys total $1000 against $1000 cash -- at a 0.95 buffer,
-    # only $950 should actually get deployed, split proportionally across both buys.
-    orders = [Order("AAPL", "buy", 600.0, "sync"), Order("MSFT", "buy", 400.0, "sync")]
-    result = apply_cash_buffer(orders, cash=1000.0, buffer_pct=0.95)
-    by_ticker = {o.ticker: o for o in result}
-    assert sum(o.notional for o in result) == pytest.approx(950.0)
-    assert by_ticker["AAPL"].notional == pytest.approx(570.0)  # 600 * 0.95
-    assert by_ticker["MSFT"].notional == pytest.approx(380.0)  # 400 * 0.95
-
-
-def test_apply_cash_buffer_leaves_sells_untouched():
-    # Available cash for buys = pre-existing cash + this batch's sell proceeds = 500 + 500 = 1000.
-    orders = [Order("AAPL", "buy", 1000.0, "sync"), Order("TSLA", "sell", 500.0, "sync", full_close=True)]
-    result = apply_cash_buffer(orders, cash=500.0, buffer_pct=0.9)
-    by_ticker = {o.ticker: o for o in result}
-    assert by_ticker["TSLA"].notional == pytest.approx(500.0)  # sell untouched, even though it funds the buy
-    assert by_ticker["TSLA"].full_close is True
-    assert by_ticker["AAPL"].notional == pytest.approx(900.0)  # (500 cash + 500 sell proceeds) * 0.9
-
-
-def test_apply_cash_buffer_noop_with_no_buy_orders():
-    orders = [Order("TSLA", "sell", 500.0, "sync", full_close=True)]
-    assert apply_cash_buffer(orders, cash=0.0, buffer_pct=0.95) == orders
-
-
-def test_apply_cash_buffer_buy_fully_funded_by_same_batch_sell_is_not_starved():
-    # Zero pre-existing cash, but a sell in the same batch covers the buy exactly --
-    # must not be scaled down to zero just because `cash` alone looks insufficient.
-    orders = [Order("AAPL", "buy", 500.0, "sync"), Order("TSLA", "sell", 500.0, "sync", full_close=True)]
-    result = apply_cash_buffer(orders, cash=0.0, buffer_pct=1.0)
-    assert result == orders
 
 
 def test_drop_subminimum_buys_removes_buys_under_the_floor():

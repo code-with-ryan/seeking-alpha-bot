@@ -96,5 +96,12 @@ def load_portfolio_file(path: str) -> dict[str, float]:
             f"(0.0374) instead of raw percentages (3.74)?",
             file=sys.stderr,
         )
+    elif total > 1.001:  # small tolerance for float-sum noise on an intentional 1.0
+        print(
+            f"Warning: weights sum to {total:.1%}, over 100% -- the cash buffer will "
+            f"silently scale every buy down to fit rather than spend more than you have, "
+            f"so you won't land on the weights as typed.",
+            file=sys.stderr,
+        )
 
     return weights
